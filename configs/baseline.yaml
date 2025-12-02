@@ -1,0 +1,46 @@
+world:
+  host: "127.0.0.1"
+  port: 2000
+  timeout: 60.0
+
+scene:
+  name: "corridor"
+  duration_s: 40
+
+ego:
+  model: "vehicle.tesla.model3"
+  autopilot: true
+  tm_port: 8000
+
+lidar:
+  channels: 32
+  rotation_hz: 10
+  points_per_second: 600000
+  range: 70.0
+  upper_fov: 10.0
+  lower_fov: -30.0
+  rmin: 1.6
+
+grid:
+  size_m: 50.0
+  resolution: 0.15
+  ema_alpha: 0.12
+  threshold: 0.32
+  morph_open: 1
+  morph_close: 2
+
+logging:
+  out_csv: "logs/baseline_corr.csv"
+  save_png_every_s: 5.0
+  fig_path: "figs/grade_baseline.png"
+
+attack:
+  enabled: false
+
+defense:
+  enabled: false
+  ttl_s: 0.4
+  rate_limit_hz: 12
+  overlap_min: 0.25
+  persistence_m: 2
+  persistence_n: 3
