@@ -14,12 +14,15 @@ from sim.occupancy_grid import (
 )
 from sim.logger_csv import CSVLogger
 
+from scripts.lidar_visor import save_pointcloud_png
+
 import matplotlib
 matplotlib.use("Agg")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FIG_DIR = PROJECT_ROOT / "figs"
 LOG_DIR = PROJECT_ROOT / "logs"
+PCD_DIR = PROJECT_ROOT / "outputs" / "pointclouds"
 
 FIG_RAW = FIG_DIR / "grade_raw.png"
 FIG_ACCUM = FIG_DIR / "grade_accum.png"
@@ -44,9 +47,29 @@ def wait_world_ready(client: carla.Client,
     raise RuntimeError(f"Mundo não ficou pronto: {last}")
 
 
+def _metrics_iou_fp_fn(a: np.ndarray, b: np.ndarray) -> tuple[float, int, int]:
+    """
+    Métricas por frame entre duas grades binárias.
+    - IoU
+    - FP: b=1 e a=0
+    - FN: b=0 e a=1
+    """
+    a1 = (a == 1)
+    b1 = (b == 1)
+
+    inter = int(np.logical_and(a1, b1).sum())
+    union = int(np.logical_or(a1, b1).sum())
+    iou = float(inter) / float(union) if union > 0 else 0.0
+
+    fp = int(np.logical_and(b1, ~a1).sum())
+    fn = int(np.logical_and(~b1, a1).sum())
+    return iou, fp, fn
+
+
 def main(runtime_s: float = 35.0, send_spoof: bool = True) -> None:
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    PCD_DIR.mkdir(parents=True, exist_ok=True)
 
     ts = time.strftime("%Y%m%d_%H%M%S")
     log_path = LOG_DIR / f"metrics_{ts}.csv"
@@ -95,7 +118,6 @@ def main(runtime_s: float = 35.0, send_spoof: bool = True) -> None:
     size_m = 50.0
     rmin = getattr(lidar, "rmin", 1.6)
 
-    # modelo a
     accum: np.ndarray | None = None
     max_accum_frames = 10
     decay_per_second = 0.1
@@ -103,13 +125,16 @@ def main(runtime_s: float = 35.0, send_spoof: bool = True) -> None:
     decay_per_frame = decay_per_second / fps_est
     threshold_count = 1
 
-    # baseline 
-    baseline_secs = 3.0
-    baseline_grid: np.ndarray | None = None
-
-    # janela do ataque
     attack_start = 8.0
     attack_end = 10.5
+
+    saved_baseline = False
+    saved_attack = False
+    saved_after = False
+
+    ref_grid: np.ndarray | None = None
+    ref_captured = False
+    ref_capture_time = attack_start - 0.4  
 
     frame_idx = 0
 
@@ -118,102 +143,124 @@ def main(runtime_s: float = 35.0, send_spoof: bool = True) -> None:
             pts = getattr(lidar.buffer, "last_points", None)
             elapsed = time.time() - t0
 
-            if pts is not None:
-                pts_np = np.asarray(pts)
-                n_pts = int(pts_np.shape[0])
+            if pts is None:
+                time.sleep(0.05)
+                continue
 
-                # -------------- modelo A grade e acumulacao --------------
-                grid, kept_xy = build_grid(
-                    pts_np,
-                    rmin=rmin,
-                    size_m=size_m,
-                    res=res,
-                    z_min=-3.0,
-                    z_max=2.0,
-                    ego_mask_r=3.2,
-                    ground_on=True,
+            pts_np = np.asarray(pts)
+            if pts_np.ndim != 2 or pts_np.shape[0] == 0:
+                time.sleep(0.05)
+                continue
+
+            n_pts_sensor = int(pts_np.shape[0])
+
+            in_attack_window = send_spoof and (attack_start < elapsed < attack_end)
+            if in_attack_window:
+                pts_fake = SpoofPatterns.phantom_cloud(
+                    cx=12.0, cy=2.0, n=900, r=2.8
                 )
+                spoofer.send_points(pts_fake, emitter_id="malicious_01")
+                pts_used = np.vstack([pts_np[:, :3], pts_fake])
+            else:
+                pts_used = pts_np[:, :3]
 
-                now = time.time()
+            n_pts_total = int(pts_used.shape[0])
 
-                if now - last_save < 1.0:
-                    save_grid_png(grid, size_m, FIG_RAW, "Grade raw (nearest)")
-                    _save_scatter(
-                        kept_xy,
-                        size_m,
-                        FIG_SCATTER,
-                        "Scatter (nearest-obstacle)",
-                    )
+            # ----------------- snapshots (LiDARVisor) -----------------
+            if (not saved_baseline) and (elapsed >= 2.0) and (elapsed < attack_start):
+                out = PCD_DIR / f"baseline_t{elapsed:.2f}_f{frame_idx:06d}.png"
+                save_pointcloud_png(pts_used, str(out))
+                print(f"[SNAPSHOT] baseline salvo: {out}")
+                saved_baseline = True
 
-                if accum is None:
-                    accum = grid.astype(np.float32)
-                else:
-                    accum = np.maximum(0.0, accum - decay_per_frame)
-                    accum += grid.astype(np.float32)
-                    accum = np.minimum(accum, float(max_accum_frames))
+            if (not saved_attack) and (elapsed >= (attack_start + 0.8)) and (elapsed <= attack_end):
+                out = PCD_DIR / f"attack_t{elapsed:.2f}_f{frame_idx:06d}.png"
+                save_pointcloud_png(pts_used, str(out))
+                print(f"[SNAPSHOT] attack salvo: {out}")
+                saved_attack = True
 
-                bin_occ = (accum >= threshold_count).astype(np.uint8)
+            if (not saved_after) and (elapsed >= (attack_end + 1.0)):
+                out = PCD_DIR / f"after_t{elapsed:.2f}_f{frame_idx:06d}.png"
+                save_pointcloud_png(pts_used, str(out))
+                print(f"[SNAPSHOT] after_attack salvo: {out}")
+                saved_after = True
 
-                if now - last_save > 3.0:
-                    save_grid_png(
-                        bin_occ, size_m, FIG_ACCUM, "Grade acumulada (>=1)"
-                    )
-                    last_save = now
+            # ----------------- pipeline: grade raw -----------------
+            grid_raw, kept_xy = build_grid(
+                pts_used,
+                rmin=rmin,
+                size_m=size_m,
+                res=res,
+                z_min=-3.0,
+                z_max=2.0,
+                ego_mask_r=3.2,
+                ground_on=True,
+            )
 
-                # -------------- modelo b pos-processamento --------------
-                post = postprocess_binary(
-                    bin_occ, kernel=5, dilate_iter=2, close_iter=1
-                )
-                save_grid_png(
-                    post, size_m, FIG_POST,
-                    "Grade 2D (ocupação) - postprocess"
-                )
+            now = time.time()
 
-                # -------------- baseline e metricas --------------
-                if elapsed < baseline_secs:
-                    baseline_grid = post.copy()
-                elif baseline_grid is not None:
-                    inter = np.logical_and(
-                        baseline_grid == 1, post == 1
-                    ).sum()
-                    union = np.logical_or(
-                        baseline_grid == 1, post == 1
-                    ).sum()
-                    iou = float(inter) / float(union) if union > 0 else 0.0
+            if now - last_save < 1.0:
+                save_grid_png(grid_raw, size_m, FIG_RAW, "Grade raw (nearest)")
+                _save_scatter(kept_xy, size_m, FIG_SCATTER, "Scatter (nearest-obstacle)")
 
-                    fp = int(
-                        np.logical_and(post == 1, baseline_grid == 0).sum()
-                    )
-                    fn = int(
-                        np.logical_and(post == 0, baseline_grid == 1).sum()
-                    )
+            # ----------------- acumulador temporal -----------------
+            if accum is None:
+                accum = grid_raw.astype(np.float32)
+            else:
+                accum = np.maximum(0.0, accum - decay_per_frame)
+                accum += grid_raw.astype(np.float32)
+                accum = np.minimum(accum, float(max_accum_frames))
 
-                    if send_spoof and (attack_start <= elapsed <= attack_end):
-                        scenario = "attack"
-                    elif elapsed < attack_start:
-                        scenario = "baseline"
-                    else:
-                        scenario = "after_attack"
+            bin_occ = (accum >= threshold_count).astype(np.uint8)
 
-                    logger.log({
-                        "frame": frame_idx,
-                        "t": elapsed,
-                        "scenario": scenario,
-                        "iou": iou,
-                        "fp": fp,
-                        "fn": fn,
-                        "n_points": n_pts,
-                    })
+            if now - last_save > 3.0:
+                save_grid_png(bin_occ, size_m, FIG_ACCUM, "Grade acumulada (>=1)")
+                last_save = now
 
-                frame_idx += 1
+            # ----------------- pós-processamento -----------------
+            post = postprocess_binary(bin_occ, kernel=5, dilate_iter=2, close_iter=1)
+            save_grid_png(post, size_m, FIG_POST, "Grade 2D (ocupação) - postprocess")
 
-            if send_spoof:
-                if attack_start < elapsed < attack_end:
-                    pts_fake = SpoofPatterns.phantom_cloud(
-                        cx=12.0, cy=2.0, n=900, r=2.8
-                    )
-                    spoofer.send_points(pts_fake, emitter_id="malicious_01")
+            # ----------------- referência pré-ataque -----------------
+            if (not ref_captured) and (elapsed >= ref_capture_time) and (elapsed < attack_start):
+                ref_grid = post.copy()
+                ref_captured = True
+                print(f"[REF] referência pré-ataque capturada em t={elapsed:.2f}s (frame {frame_idx})")
 
+            # ----------------- cenário -----------------
+            if send_spoof and (attack_start <= elapsed <= attack_end):
+                scenario = "attack"
+            elif elapsed < attack_start:
+                scenario = "baseline"
+            else:
+                scenario = "after_attack"
+
+            iou, fp, fn = _metrics_iou_fp_fn(grid_raw, post)
+
+            iou_vs_ref = None
+            fp_vs_ref = None
+            fn_vs_ref = None
+            if ref_grid is not None and scenario in ("attack", "after_attack"):
+                iou_vs_ref, fp_vs_ref, fn_vs_ref = _metrics_iou_fp_fn(ref_grid, post)
+
+            logger.log({
+                "frame": frame_idx,
+                "t": elapsed,
+                "scenario": scenario,
+
+                "iou": iou,
+                "fp": fp,
+                "fn": fn,
+
+                "iou_vs_ref": iou_vs_ref if iou_vs_ref is not None else "",
+                "fp_vs_ref": fp_vs_ref if fp_vs_ref is not None else "",
+                "fn_vs_ref": fn_vs_ref if fn_vs_ref is not None else "",
+
+                "n_points_sensor": n_pts_sensor,
+                "n_points_total": n_pts_total,
+            })
+
+            frame_idx += 1
             time.sleep(0.05)
 
     finally:
