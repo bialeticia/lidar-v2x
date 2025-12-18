@@ -70,17 +70,3 @@ python -m scripts.run_intermediate
 Attack logs, metrics, and occupancy-grid figures will be produced automatically.
 
 ---
-
-## 📊 **Expected Results**
-
-Based on the default parameters, the system exhibits:
-
-| Scenario  | Mean IoU | Mean FP | Mean FN |
-| --------- | -------: | ------: | ------: |
-| Baseline  |    ~0.00 |     614 |    1640 |
-| Attack    |    ~0.00 |    1343 |    1640 |
-| Mitigated |    ~0.01 |    5738 |    1553 |
-
-These results demonstrate the degradation caused by spoofing and partial robustness afforded by low-complexity filters.
-
----
